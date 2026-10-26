@@ -1,0 +1,31 @@
+# The watch list: an incident is ours if it touches one of these packages.
+# Read by bin/mu-incidents. One package per line; '#' starts a comment.
+#
+# Names are written as the squad's SMELT list has them, in binary-package terms
+# ("libguestfs0"). mu-incidents drops a trailing soname digit from both sides
+# before comparing, so they also match the source-package names the dashboard
+# and SMELT report ("libguestfs").
+#
+# kernel-source is the one most likely to surprise you: a kernel incident is a
+# virtualization incident, because the hypervisor rides on it. It also produces
+# the widest fan-out of red boxes when it breaks.
+#
+# The list is packages, not products. The same package appears across SLE 12,
+# 15, 16 and SL Micro.
+#
+# Something virtualization-shaped that is not on this list is a question for the
+# team channel, not a silent yes or no. `mu-incidents --near` shows those.
+#
+# Source: "New MU VT incident test process since 2023", qasle space, What/Duties,
+# last updated 2025-02-17.
+# https://confluence.suse.com/spaces/qasle/pages/1278050323
+
+xen
+qemu
+libvirt
+kvm
+kernel-source
+libguestfs0
+virt-manager
+libslirp0
+open-vm-tools

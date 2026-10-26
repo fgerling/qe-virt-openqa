@@ -1,0 +1,55 @@
+#!/bin/sh
+# Open the QE-Virt maintenance-update review round in the browser.
+#
+#   open-mu-groups            dashboard + smelt + every group in etc/job-groups
+#   open-mu-groups --groups   job groups only
+#
+# Override the browser with BROWSER=chromium open-mu-groups
+#
+# Read-only: these are all overview pages. Nothing here schedules a job.
+
+set -eu
+
+BROWSER=${BROWSER:-firefox}
+OSD=https://openqa.suse.de/group_overview
+
+ENTRY="https://dashboard.qam.suse.de/blocked?group_names=Virtualization
+https://smelt.suse.de/slfo-beta/updates?status=testing"
+
+case "${1:-}" in
+    --groups)
+        ENTRY=
+        ;;
+    -h|--help)
+        sed -n '2,10p' "$0" | cut -c3-
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "open-mu-groups: unknown option '$1'" >&2
+        exit 2
+        ;;
+esac
+
+HERE=$(dirname "$(readlink -f "$0")")
+GROUPS_FILE="$HERE/../etc/job-groups"
+
+[ -r "$GROUPS_FILE" ] || {
+    echo "open-mu-groups: cannot read $GROUPS_FILE" >&2
+    exit 2
+}
+
+# One ID per line, '#' comments; the file says what each group is.
+# Not named GROUPS: bash defines that as a special read-only array of the
+# user's group IDs, so the assignment is silently ignored and the loop below
+# would open group_overview/<your gid> instead.
+JOB_GROUPS=$(sed 's/#.*//' "$GROUPS_FILE")
+
+for url in $ENTRY; do
+    "$BROWSER" "$url"
+done
+
+for group in $JOB_GROUPS; do
+    "$BROWSER" "$OSD/$group"
+done

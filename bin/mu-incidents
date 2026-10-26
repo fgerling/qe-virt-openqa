@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Which maintenance updates are ours? Filter every open incident by the watch list.
+
+  mu-incidents               open incidents touching a watch-list package
+  mu-incidents --brief       one line each -- what mu-round prints
+  mu-incidents --all         include the approved and the inactive ones
+  mu-incidents --near        also show virt-shaped packages *not* on the watch list
+  mu-incidents --fast        skip the per-incident flavor lookup (one HTTP call total)
+  mu-incidents --package X   add X to the watch list for this run (repeatable)
+  mu-incidents --json        machine-readable, for jq
+
+Why this exists: neither web entry point answers "which updates are waiting on
+QE-Virt" on its own.
+
+  dashboard.qam.suse.de/blocked?group_names=Virtualization
+      A JavaScript app, so not scriptable, and its Virtualization filter is
+      SLE 12/15 only -- SLE 16 / SLFO work is invisible there.
+  smelt.suse.de/slfo-beta/updates?status=testing
+      Also a JavaScript app, and the mirror image: SLFO only.
+
+The dashboard's *API* has neither gap. GET /api/incidents returns every active
+incident from both worlds in one unauthenticated call -- 'smelt' incidents for
+SLE 12/15 and 'git' incidents (SUSE:SLFO PullRequests) for SLE 16 and SL Micro
+6.2 -- each with its package list. So the filtering can happen here instead of
+in a web UI that cannot express it.
+
+Two columns beyond "the package matches", both of which decide what to do next:
+
+  NO JOBS SCHEDULED YET   nothing has been scheduled for the incident at all.
+                          Per MU SMELT that is either an incident younger than
+                          the 8-hourly auto-schedule.sh cron on void.suse.de,
+                          or a stuck cron and a manual ./auto_schedule.sh push.
+  group NNN               the flavors scheduled for it that one of *our* job
+                          groups actually runs.  A watch-list package with
+                          no such flavor is a real update that produces nothing
+                          for us to review -- worth a question, not a wait.
+
+Read-only throughout: plain GETs against dashboard.qam.suse.de and
+openqa.suse.de, no API key, no VPN.  The watch list is etc/watch-list.  See
+the MU APIs, MU SMELT and MU Job Groups tiddlers.
+"""
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DASHBOARD = "https://dashboard.qam.suse.de"
+SMELT = "https://smelt.suse.de"
+OSD = "https://openqa.suse.de"
+HERE = Path(__file__).resolve().parent
+
+# Both kept out of the script so changing them is not a code change.  One
+# entry per line; '#' starts a comment.
+JOB_GROUPS = HERE.parent / "etc" / "job-groups"
+WATCH_LIST = HERE.parent / "etc" / "watch-list"
+
+TIMEOUT = 60
+
+# A package is ours if its *stem* matches a watch-list stem.  The stem is the
+# name with a trailing soname digit removed, because the watch list is written
+# in binary-package terms ("libguestfs0", "libslirp0") while both the dashboard
+# and SMELT report source-package names ("libguestfs", "libslirp").  Matching
+# the two literally silently drops real work: incident 45948 is a libguestfs
+# update that schedules Server-DVD-Incidents-VIRT-Tools, and an exact-match
+# filter does not see it at all.
+SONAME_SUFFIX = re.compile(r"\d+$")
+
+# Not on the watch list, but virt-shaped enough that "nobody looked at it" is a
+# worse outcome than a question in #qe-virt.  Only consulted for --near.
+NEAR_MISS = re.compile(r"virt|kvm|xen|qemu|guestfs|slirp|vm-tools|kernel", re.I)
+
+# Our flavors come from the groups' own templates rather than from a pattern on
+# the flavor name.  A name-based guess is wrong in both directions: it misses
+# Default-Virt-Incidents-style SL Micro flavors unless you special-case them,
+# and it claims Minimal-VM-for-kvm-and-xen-Updates-Staging, which is group 676
+# and not ours.  Scraped with a regex, not yaml.safe_load, because at least one
+# group YAML reuses an anchor name and PyYAML refuses the whole document.
+FLAVOR_LINE = re.compile(r"^\s*flavor:\s*(\S+)\s*$", re.M)
+
+
+class Error(Exception):
+    """Anything that should end the run with a message rather than a traceback."""
+
+
+def get_json(url):
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise Error(f"{url}: HTTP {exc.code} {exc.reason}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise Error(f"{url}: {exc}") from exc
+    except ValueError as exc:
+        raise Error(f"{url}: not JSON: {exc}") from exc
+
+
+def get_json_or_none(url):
+    """For the enrichment calls: a missing answer degrades the row, not the run."""
+    try:
+        return get_json(url)
+    except Error:
+        return None
+
+
+def get_text(url):
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+            return response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as exc:
+        raise Error(f"{url}: {exc}") from exc
+
+
+def read_group_ids(path):
+    """Job group IDs from etc/job-groups, comments and blank lines dropped."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Error(f"cannot read the job groups: {exc}") from exc
+
+    gids = []
+    for line in lines:
+        gids.extend(line.split("#", 1)[0].split())
+
+    # A group name written without its '#' would otherwise be queried as a group.
+    bad = [gid for gid in gids if not gid.isdigit()]
+    if bad:
+        raise Error(f"{path}: not a job group ID: {', '.join(bad)}")
+    if not gids:
+        raise Error(f"no job group IDs found in {path}")
+    return [int(gid) for gid in gids]
+
+
+def our_flavors(group_ids):
+    """flavor -> the job groups of ours that schedule it.
+
+    One GET per group against the templates endpoint, which serves the group
+    YAML.  Cheap enough (well under a second for all eight) to do every run
+    rather than cache, and caching would go stale exactly when a group grows a
+    new flavor -- which is the case worth catching.
+    """
+    mapping = {}
+    for gid in group_ids:
+        yaml_text = get_text(f"{OSD}/api/v1/job_templates_scheduling/{gid}")
+        for flavor in set(FLAVOR_LINE.findall(yaml_text)):
+            mapping.setdefault(flavor, []).append(gid)
+    if not mapping:
+        raise Error("no flavors found in any job group template")
+    return mapping
+
+
+def read_watch_list(path):
+    """Package names from the watch list, comments and blank lines dropped."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Error(f"cannot read the watch list: {exc}") from exc
+
+    # split() rather than strip(): two names on one line become two packages,
+    # not one name with a space in it that silently never matches.
+    packages = []
+    for line in lines:
+        packages.extend(line.split("#", 1)[0].split())
+
+    if not packages:
+        raise Error(f"no watch-list packages found in {path}")
+    return packages
+
+
+def stem(name):
+    return SONAME_SUFFIX.sub("", name)
+
+
+def package_names(incident):
+    """Both halves of the SLFO 'source:binary' form, plus the plain names.
+
+    Git incidents list a kernel as 'kernel-source:kernel-rt'; splitting means a
+    watch-list entry matches whichever half it is written in.
+    """
+    names = set()
+    for package in incident.get("packages") or []:
+        names.add(package)
+        names.update(package.split(":"))
+    return names
+
+
+def matched_packages(incident, watch_stems):
+    return sorted(n for n in package_names(incident) if stem(n) in watch_stems)
+
+
+def near_miss_packages(incident, watch_stems):
+    return sorted(
+        n
+        for n in package_names(incident)
+        if stem(n) not in watch_stems and NEAR_MISS.search(n)
+    )
+
+
+def incident_url(incident):
+    """Git incidents carry their own Gitea PR URL; smelt ones follow a pattern."""
+    if incident.get("url"):
+        return incident["url"]
+    return f"{SMELT}/incident/{incident['number']}/"
+
+
+def flavors(number):
+    """The openQA flavors qem-bot scheduled for this incident, with counts.
+
+    Returns None if the lookup failed, {} if the incident has no settings at
+    all -- and that empty case is the interesting one.  Per MU SMELT, an
+    incident with no jobs is either younger than the 8-hourly auto-schedule.sh
+    cron on void.suse.de, or that cron is stuck and it needs a manual push.
+    """
+    settings = get_json_or_none(f"{DASHBOARD}/api/incident_settings/{number}")
+    if settings is None:
+        return None
+    counts = {}
+    for entry in settings:
+        flavor = entry.get("flavor")
+        if flavor:
+            counts[flavor] = counts.get(flavor, 0) + 1
+    return counts
+
+
+def state_flags(incident):
+    flags = []
+    if incident.get("embargoed"):
+        flags.append("embargoed")
+    if incident.get("approved"):
+        flags.append("approved")
+    if not incident.get("isActive"):
+        flags.append("inactive")
+    if incident.get("inReviewQAM"):
+        flags.append("qam-review")
+    elif incident.get("inReview"):
+        flags.append("in-review")
+    return flags
+
+
+def is_open(incident):
+    """Still wants something from somebody."""
+    return bool(incident.get("isActive")) and not incident.get("approved")
+
+
+def collect(args, watch_stems):
+    incidents = get_json(f"{DASHBOARD}/api/incidents")
+    if not isinstance(incidents, list):
+        raise Error("unexpected /api/incidents payload: not a list")
+
+    squad_flavors = {} if args.fast else our_flavors(read_group_ids(JOB_GROUPS))
+
+    rows = []
+    for incident in incidents:
+        if not args.all and not is_open(incident):
+            continue
+
+        ours = matched_packages(incident, watch_stems)
+        near = near_miss_packages(incident, watch_stems) if args.near else []
+        if not ours and not near:
+            continue
+
+        row = {
+            "number": incident.get("number"),
+            "kind": incident.get("type"),
+            "priority": incident.get("priority") or 0,
+            "packages": ours,
+            "near_miss": near,
+            "on_watch_list": bool(ours),
+            "flags": state_flags(incident),
+            "rr_number": incident.get("rr_number"),
+            "url": incident_url(incident),
+            "dashboard_url": f"{DASHBOARD}/incident/{incident.get('number')}",
+        }
+
+        if not args.fast:
+            counts = flavors(row["number"])
+            row["flavors"] = counts
+            row["our_flavors"] = (
+                {
+                    f: {"jobs": n, "groups": squad_flavors[f]}
+                    for f, n in counts.items()
+                    if f in squad_flavors
+                }
+                if counts
+                else {}
+            )
+            row["scheduled"] = None if counts is None else bool(counts)
+        rows.append(row)
+
+    rows.sort(key=lambda r: (-r["priority"], r["number"]))
+    return rows
+
+
+def where(row):
+    """The one-word answer to "and does that reach us?", for --brief."""
+    if row["scheduled"] is None:
+        return "?"
+    if not row["scheduled"]:
+        return "UNSCHEDULED"
+    groups = sorted({g for info in row["our_flavors"].values() for g in info["groups"]})
+    if not groups:
+        return "not ours"
+    return "group " + ",".join(str(g) for g in groups)
+
+
+def render(rows, args, out=sys.stdout):
+    if not rows:
+        print("no matching incidents", file=out)
+        return
+
+    for row in rows:
+        marker = " " if row["on_watch_list"] else "?"
+        flags = " ".join(row["flags"])
+        packages = ",".join(row["packages"] or row["near_miss"])
+        width = 28 if args.brief else 44
+        line = (
+            f"{marker} {row['number']:>7}  {row['kind']:<5} "
+            f"prio {row['priority']:>4}  {packages[:width]:<{width}}"
+        )
+        if args.brief:
+            line += f"  {where(row):<18}"
+        print(f"{line}  {flags}".rstrip(), file=out)
+
+        if args.fast or args.brief:
+            continue
+
+        total = sum(row["flavors"].values()) if row["flavors"] else 0
+        if row["scheduled"] is None:
+            print("             flavors unavailable", file=out)
+        elif not row["scheduled"]:
+            print("             NO JOBS SCHEDULED YET", file=out)
+        elif row["our_flavors"]:
+            for flavor, info in sorted(row["our_flavors"].items()):
+                groups = ",".join(str(g) for g in info["groups"])
+                print(
+                    f"             {info['jobs']:>3}  {flavor:<44} group {groups}",
+                    file=out,
+                )
+            print(f"             ({total} jobs in total, all squads)", file=out)
+        else:
+            print(
+                f"             none of our groups -- {total} jobs over "
+                f"{len(row['flavors'])} other flavors",
+                file=out,
+            )
+
+    watched = sum(1 for r in rows if r["on_watch_list"])
+    summary = [f"{watched} on the watch list"]
+    if args.near:
+        summary.append(f"{len(rows) - watched} near miss")
+    if not args.fast:
+        summary.append(f"{sum(1 for r in rows if r.get('scheduled') is False)} unscheduled")
+        summary.append(f"{sum(1 for r in rows if r.get('our_flavors'))} in our groups")
+    print("\n" + " · ".join(summary), file=out)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="mu-incidents",
+        description="Open maintenance incidents touching a QE-Virt package.",
+        epilog="Read-only. See the MU APIs tiddler.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="include approved and inactive incidents",
+    )
+    parser.add_argument(
+        "--near",
+        action="store_true",
+        help="also show virt-shaped packages that are not on the watch list",
+    )
+    detail = parser.add_mutually_exclusive_group()
+    detail.add_argument(
+        "--brief",
+        action="store_true",
+        help="one line per incident, with the job groups it reaches",
+    )
+    detail.add_argument(
+        "--fast",
+        action="store_true",
+        help="skip the per-incident flavor lookup (one HTTP call in total)",
+    )
+    parser.add_argument(
+        "--package",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="add NAME to the watch list for this run (repeatable)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        watch = read_watch_list(WATCH_LIST) + args.package
+        rows = collect(args, {stem(name) for name in watch})
+    except Error as exc:
+        print(f"mu-incidents: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        render(rows, args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

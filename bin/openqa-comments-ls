@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""What I said on openQA: my review comments, grouped by job group.
+
+  openqa-comments-ls                     my comments in the last 7 days
+  openqa-comments-ls --days 30           wider window
+  openqa-comments-ls --date 2026-09-11   one day
+  openqa-comments-ls --since 2026-09-01 --until 2026-09-05
+  openqa-comments-ls --user nicksinger   somebody else's
+  openqa-comments-ls --everyone          every author, mine marked with *
+  openqa-comments-ls --group 559         one group only (repeatable)
+  openqa-comments-ls --full --urls       untruncated text, one URL per row
+  openqa-comments-ls --json              machine-readable, for jq
+
+Why this exists: openQA has no way to ask "what have I commented on". There is
+no comment search and no per-user feed -- /api/v1/comments, /comments and
+/admin/comments are all 404, and comments are only reachable one job at a time
+via /api/v1/jobs/<id>/comments. So the job set has to be narrowed first and
+then swept, which is the whole shape of this script: list the recent
+failed/incomplete jobs in the MU groups (one request per group, and that
+listing already carries test/group/t_finished), keep the ones that finished
+near the window, and only ask those for comments. That is ~130 requests
+instead of the ~5000 a full sweep of those groups would take.
+
+Because the sweep is job-driven, the window has two halves. --days/--date/
+--since/--until select which *comments* to show; --lookback says how far
+before that to keep scanning *jobs*, since a comment written today usually
+lands on a job that finished earlier in the week. A comment on a job older
+than the lookback is not found -- widen it if you are digging up old triage.
+
+Read-only throughout: plain GETs against openqa.suse.de, no API key, no VPN.
+See the MU APIs tiddler.
+"""
+
+import argparse
+import json
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from datetime import date, datetime, time, timedelta
+from functools import lru_cache
+from pathlib import Path
+
+OSD = "https://openqa.suse.de"
+HERE = Path(__file__).resolve().parent
+JOB_GROUPS = HERE.parent / "etc" / "job-groups"
+
+BUGREF = re.compile(r"\b(?:bsc|boo|poo|jsc|gh)#\S+")
+TAG = re.compile(r"#(?:Automation Framework|Automation Test|Environmental) Issue#|#Product Failure#")
+
+# Newest N jobs per group per result. The default window holds a couple of
+# dozen per group, so this is headroom -- but it is a cap, not a window, and
+# candidates() says so when a listing fills up while still inside the window.
+JOB_LIST_LIMIT = 400
+
+MINE = "*"
+
+
+def get_json(url):
+    with urllib.request.urlopen(url) as response:
+        # openQA comment text carries raw \r, which strict JSON rejects.
+        return json.loads(response.read().decode("utf-8", "replace"), strict=False)
+
+
+def get_json_or_none(url):
+    """For the per-job sweep: a missing answer drops a job, not the run."""
+    try:
+        return get_json(url)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def read_group_ids(path):
+    """Job group IDs from etc/job-groups, comments and blank lines dropped."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        sys.exit(f"cannot read the job groups: {exc}")
+
+    gids = []
+    for line in lines:
+        gids.extend(line.split("#", 1)[0].split())
+
+    # A group name written without its '#' would otherwise be queried as a group.
+    bad = [gid for gid in gids if not gid.isdigit()]
+    if bad:
+        sys.exit(f"{path}: not a job group ID: {', '.join(bad)}")
+    if not gids:
+        sys.exit(f"{path}: no job group IDs found")
+    return gids
+
+
+@lru_cache(maxsize=None)
+def group_name(gid):
+    groups = get_json_or_none(f"{OSD}/api/v1/job_groups/{gid}")
+    return groups[0]["name"] if groups else f"group {gid}"
+
+
+def candidates(gids, results, scan_start, window_end):
+    """Jobs old enough to carry a comment from the window, newest first."""
+    jobs = []
+    warnings = []
+    for gid in gids:
+        for result in results:
+            url = f"{OSD}/api/v1/jobs?groupid={gid}&result={result}&limit={JOB_LIST_LIMIT}"
+            listing = get_json(url)["jobs"]
+
+            finishes = []
+            for job in listing:
+                if not job.get("t_finished"):
+                    continue
+                finished = datetime.fromisoformat(job["t_finished"])
+                finishes.append(finished)
+                if scan_start <= finished <= window_end:
+                    job["group"] = gid
+                    jobs.append(job)
+
+            # Newest-first and capped: if even the oldest entry is inside the
+            # scan window, the window was cut short and older commented jobs
+            # were never looked at.
+            if len(listing) >= JOB_LIST_LIMIT and finishes and min(finishes) > scan_start:
+                warnings.append(
+                    f"group {gid} ({result}): hit the {JOB_LIST_LIMIT}-job listing cap, "
+                    f"scanned only back to {min(finishes).date()}"
+                )
+
+    jobs.sort(key=lambda j: j["t_finished"], reverse=True)
+    return jobs, warnings
+
+
+def collect(jobs, user, first, last):
+    """Comments on `jobs` written between `first` and `last` inclusive."""
+    rows = []
+    for job in jobs:
+        comments = get_json_or_none(f"{OSD}/api/v1/jobs/{job['id']}/comments")
+        if not comments:
+            continue
+        for comment in comments:
+            author = comment.get("userName", "")
+            if user and author != user:
+                continue
+            # openQA answers in UTC; the window is in local days.
+            created = datetime.strptime(
+                comment["created"], "%Y-%m-%d %H:%M:%S %z"
+            ).astimezone()
+            if not first <= created.date() <= last:
+                continue
+            text = " ".join(comment.get("text", "").split())
+            rows.append({
+                "group": job["group"],
+                "group_name": group_name(job["group"]),
+                "id": job["id"],
+                "test": job["test"],
+                "result": job["result"],
+                "author": author,
+                "created": created.isoformat(timespec="seconds"),
+                "when": created,
+                "tags": TAG.findall(text),
+                "bugrefs": BUGREF.findall(text),
+                "text": text,
+                "url": f"{OSD}/tests/{job['id']}",
+            })
+    rows.sort(key=lambda r: (str(r["group"]), r["when"]))
+    return rows
+
+
+def render(rows, warnings, me, span_days, full, show_urls):
+    stamp = "%m-%d %H:%M" if span_days > 1 else "%H:%M"
+    width = shutil.get_terminal_size().columns
+
+    for gid in dict.fromkeys(r["group"] for r in rows):
+        in_group = [r for r in rows if r["group"] == gid]
+        print(f"\ngroup {gid} — {in_group[0]['group_name']}")
+        test_width = max(len(r["test"]) for r in in_group)
+        for row in in_group:
+            mark = MINE if row["author"] == me else " "
+            head = (f"  {mark}{row['when']:{stamp}}  {row['id']}  "
+                    f"{row['test']:<{test_width}}  ")
+            text = row["text"]
+            if not full and len(head) + len(text) > width:
+                text = text[: max(20, width - len(head) - 1)] + "…"
+            print(head + text)
+            if show_urls:
+                print(f"      {row['url']}")
+
+    tags = {}
+    for row in rows:
+        for tag in row["tags"] or ["(untagged)"]:
+            tags[tag] = tags.get(tag, 0) + 1
+
+    jobs = len({r["id"] for r in rows})
+    bugrefs = sum(1 for r in rows if r["bugrefs"])
+    carry = "carries" if bugrefs == 1 else "carry"
+    print(f"\n{len(rows)} comments on {jobs} jobs · {bugrefs} {carry} a bugref")
+    for tag, count in sorted(tags.items(), key=lambda kv: -kv[1]):
+        print(f"  {count:>4}  {tag}")
+
+    for warning in warnings:
+        print(f"\nincomplete scan: {warning} — the cap stops the sweep before --lookback does")
+
+
+def parse_day(value):
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a YYYY-MM-DD date")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-d", "--days", type=int, default=7, metavar="N",
+                        help="comments from the last N days (default: 7)")
+    parser.add_argument("--date", type=parse_day, metavar="YYYY-MM-DD",
+                        help="comments from one day only")
+    parser.add_argument("--since", type=parse_day, metavar="YYYY-MM-DD",
+                        help="first day to show comments from")
+    parser.add_argument("--until", type=parse_day, metavar="YYYY-MM-DD",
+                        help="last day to show comments from (default: today)")
+    parser.add_argument("-l", "--lookback", type=int, default=7, metavar="N",
+                        help="also sweep jobs that finished up to N days before the "
+                             "window (default: 7)")
+    parser.add_argument("-u", "--user", default="fgerling", metavar="NAME",
+                        help="comment author to look for (default: fgerling)")
+    parser.add_argument("-e", "--everyone", action="store_true",
+                        help=f"every author, not just --user; yours marked {MINE}")
+    parser.add_argument("-g", "--group", action="append", metavar="ID",
+                        help="only this group, repeatable (default: all of etc/job-groups)")
+    parser.add_argument("-r", "--result", action="append", metavar="RESULT",
+                        help="job result to sweep, repeatable (default: failed, incomplete)")
+    parser.add_argument("-f", "--full", action="store_true",
+                        help="do not truncate comment text to the terminal width")
+    parser.add_argument("--urls", action="store_true", help="print a job URL per row")
+    parser.add_argument("-j", "--json", action="store_true", help="emit JSON instead of a table")
+    args = parser.parse_args()
+
+    if args.date and (args.since or args.until):
+        parser.error("--date cannot be combined with --since/--until")
+
+    if args.date:
+        first = last = args.date
+    else:
+        last = args.until or date.today()
+        first = args.since or last - timedelta(days=args.days - 1)
+    if first > last:
+        parser.error(f"empty window: {first} is after {last}")
+
+    gids = args.group or read_group_ids(JOB_GROUPS)
+    results = args.result or ("failed", "incomplete")
+    scan_start = datetime.combine(first - timedelta(days=args.lookback), time.min)
+
+    jobs, warnings = candidates(gids, results, scan_start, datetime.combine(last, time.max))
+    if jobs and sys.stderr.isatty():
+        print(f"sweeping {len(jobs)} jobs in {len(gids)} groups…", file=sys.stderr)
+
+    rows = collect(jobs, None if args.everyone else args.user, first, last)
+
+    if args.json:
+        for row in rows:
+            row.pop("when")
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+
+    if not rows:
+        who = "anyone" if args.everyone else args.user
+        window = f"{first}" if first == last else f"{first}..{last}"
+        print(f"No comments by {who} on {window} in {len(jobs)} swept jobs.")
+        return
+
+    render(rows, warnings, args.user, (last - first).days + 1, args.full, args.urls)
+
+
+if __name__ == "__main__":
+    main()

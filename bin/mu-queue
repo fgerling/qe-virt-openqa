@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""The MU review worklist: every job that still needs a verdict.
+
+  mu-queue                 untriaged jobs in the last 7 days, grouped by job group
+  mu-queue --all           show the reviewed and moot ones too
+  mu-queue --days 3        narrower window
+  mu-queue --json          machine-readable, for jq
+  mu-queue --group 559     one group only (repeatable)
+
+Why this exists: /tests/overview -- which the web UI, openqa-revtui and the QAM
+dashboard all build on -- is a *build* view, and a matrix at that. It shows one
+build per group and one job per test-suite x machine cell, so it hides both the
+other open incidents and any failure whose cell has since been taken by a newer
+job. /api/v1/jobs does neither: it is group-scoped, takes a result filter, and
+never deduplicates. That makes it the only honest answer to "what is left".
+
+A job drops out of the worklist for two reasons, and both are shown by --all:
+
+  reviewed  it already carries a bugref (bsc#/poo#/boo#/jsc#) in a comment
+  moot      its incident is approved, or no longer active on the QAM dashboard
+
+Read-only throughout: plain GETs against openqa.suse.de and
+dashboard.qam.suse.de, no API key, no VPN. See the MU APIs tiddler.
+"""
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
+
+OSD = "https://openqa.suse.de"
+DASHBOARD = "https://dashboard.qam.suse.de"
+HERE = Path(__file__).resolve().parent
+JOB_GROUPS = HERE.parent / "etc" / "job-groups"
+
+BUGREF = re.compile(r"\b(?:bsc|boo|poo|jsc|gh)#")
+
+OPEN, MOOT, NONE = "○", "●", " "  # incident open / moot / not an incident
+
+
+def get_json(url):
+    with urllib.request.urlopen(url) as response:
+        return json.load(response)
+
+
+def get_json_or_none(url):
+    """For the enrichment calls: a missing answer degrades the row, not the run."""
+    try:
+        return get_json(url)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def read_group_ids(path):
+    """Job group IDs from etc/job-groups, comments and blank lines dropped."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        sys.exit(f"cannot read the job groups: {exc}")
+
+    gids = []
+    for line in lines:
+        gids.extend(line.split("#", 1)[0].split())
+
+    # A group name written without its '#' would otherwise be queried as a group.
+    bad = [gid for gid in gids if not gid.isdigit()]
+    if bad:
+        sys.exit(f"{path}: not a job group ID: {', '.join(bad)}")
+    if not gids:
+        sys.exit(f"{path}: no job group IDs found")
+    return gids
+
+
+@lru_cache(maxsize=None)
+def group_name(gid):
+    groups = get_json_or_none(f"{OSD}/api/v1/job_groups/{gid}")
+    return groups[0]["name"] if groups else f"group {gid}"
+
+
+def candidates(gid, days):
+    """Jobs in `gid` that need a verdict and finished within `days`.
+
+    Two requests rather than one repeated result= parameter: the limit applies
+    to the combined set, and a group with hundreds of failures would otherwise
+    crowd out its incompletes.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    jobs = []
+    for result in ("failed", "incomplete"):
+        for job in get_json(f"{OSD}/api/v1/jobs?groupid={gid}&result={result}&limit=400")["jobs"]:
+            finished = job.get("t_finished")
+            if not finished:
+                continue
+            if datetime.fromisoformat(finished).replace(tzinfo=timezone.utc) >= cutoff:
+                jobs.append(job)
+    jobs.sort(key=lambda j: j["t_finished"], reverse=True)
+    return jobs
+
+
+def has_bugref(job_id):
+    comments = get_json_or_none(f"{OSD}/api/v1/jobs/{job_id}/comments")
+    if comments is None:
+        return False
+    return any(BUGREF.search(comment.get("text", "")) for comment in comments)
+
+
+def failing_module(job_id):
+    details = get_json_or_none(f"{OSD}/api/v1/jobs/{job_id}/details")
+    if not details:
+        return ""
+    for module in details.get("job", {}).get("testresults") or []:
+        if module.get("result") in ("failed", "incomplete"):
+            return module.get("name", "")
+    return ""
+
+
+@lru_cache(maxsize=None)
+def incident_state(number):
+    """(marker, moot) for an incident number, from the QAM dashboard.
+
+    The dashboard only carries *active* incidents, so a 404 means the update has
+    been released or withdrawn -- which is as good a reason to skip the job as an
+    explicit approval. A dashboard outage returns None and leaves the row alone.
+    """
+    try:
+        incident = get_json(f"{DASHBOARD}/api/incidents/{number}")
+    except urllib.error.HTTPError as error:
+        return (MOOT, True) if error.code == 404 else (OPEN, False)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    moot = incident.get("approved") or not incident.get("isActive")
+    return (MOOT, True) if moot else (OPEN, False)
+
+
+def collect(gids, days):
+    rows = []
+    for gid in gids:
+        for job in candidates(gid, days):
+            settings = job["settings"]
+            incident = settings.get("INCIDENT_ID")
+            marker, moot = NONE, False
+            if incident:
+                state = incident_state(incident)
+                if state:
+                    marker, moot = state
+            reviewed = has_bugref(job["id"])
+            rows.append({
+                "group": gid,
+                "group_name": group_name(gid),
+                "id": job["id"],
+                "result": job["result"],
+                "build": settings.get("BUILD", ""),
+                "test": job["test"],
+                "machine": settings.get("MACHINE", ""),
+                "module": failing_module(job["id"]),
+                "incident": incident or "",
+                "marker": marker,
+                "reviewed": reviewed,
+                "moot": moot,
+                "untriaged": not reviewed and not moot,
+                "url": f"{OSD}/tests/{job['id']}",
+                "finished": job["t_finished"],
+            })
+    return rows
+
+
+def render(rows, show_all, show_urls):
+    shown = rows if show_all else [r for r in rows if r["untriaged"]]
+    for gid in dict.fromkeys(r["group"] for r in shown):
+        in_group = [r for r in shown if r["group"] == gid]
+        print(f"\ngroup {gid} — {in_group[0]['group_name']}")
+        widths = [max(len(str(r[k])) for r in in_group) for k in ("build", "test", "module")]
+        for row in in_group:
+            flag = "" if row["untriaged"] else ("  [reviewed]" if row["reviewed"] else "  [moot]")
+            print(f"  {row['id']}  {row['build']:<{widths[0]}}  {row['test']:<{widths[1]}}  "
+                  f"{row['module']:<{widths[2]}}  {row['incident']:>6} {row['marker']}{flag}".rstrip())
+            if show_urls:
+                print(f"      {row['url']}")
+
+    total = len(rows)
+    reviewed = sum(1 for r in rows if r["reviewed"])
+    moot = sum(1 for r in rows if r["moot"] and not r["reviewed"])
+    untriaged = sum(1 for r in rows if r["untriaged"])
+    print(f"\n{total} need a verdict · {reviewed} have a bugref · "
+          f"{moot} on moot incidents · {untriaged} untriaged")
+    if not show_all and total != untriaged:
+        print("(--all to see the hidden ones)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-d", "--days", type=int, default=7, metavar="N",
+                        help="how far back to look (default: 7)")
+    parser.add_argument("-g", "--group", action="append", metavar="ID",
+                        help="only this group, repeatable (default: all of etc/job-groups)")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="also show reviewed and moot jobs")
+    parser.add_argument("-u", "--urls", action="store_true", help="print a job URL per row")
+    parser.add_argument("-j", "--json", action="store_true", help="emit JSON instead of a table")
+    args = parser.parse_args()
+
+    gids = args.group or read_group_ids(JOB_GROUPS)
+    rows = collect(gids, args.days)
+
+    if args.json:
+        json.dump(rows if args.all else [r for r in rows if r["untriaged"]], sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        render(rows, args.all, args.urls)
+
+
+if __name__ == "__main__":
+    main()

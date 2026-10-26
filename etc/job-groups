@@ -1,0 +1,15 @@
+# The openQA job groups on openqa.suse.de that make up the MU review round.
+# Read by every tool in bin/ that walks the groups. One ID per line; '#' starts
+# a comment. The names are only a reminder: the tools that print a group name
+# fetch it from the API, so a renamed group needs no change here.
+#
+# bin/mu-group-owners shows who owns a group, if you are unsure whether it is ours.
+
+542   # Virtualization Maintenance Updates
+559   # Virtualization SLES Incidents for SLE15/12
+570   # SL Micro Staging Updates - Virtualization
+575   # SL Micro Product Increments - Virtualization
+686   # Maintenance: SLES 16.X Virtualization Staging
+687   # Maintenance: SLES 16.0 Virtualization Increment
+691   # SL Micro 6.2 Product Increments - Virtualization
+692   # SL Micro 6.2 Staging Updates - Virtualization

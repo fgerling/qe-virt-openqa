@@ -1,0 +1,299 @@
+#!/bin/sh
+# Search the squad's Redmine backlog before filing a new ticket.
+#
+#   mu-backlog TEXT            open issues whose subject contains TEXT
+#   mu-backlog -m [TEXT]       only the MU ones -- subject carries [MU]
+#   mu-backlog -f TEXT         full text: subject, description and journal notes
+#                              (a word search: every word must appear, so give
+#                              it two or three distinctive ones, not a pasted
+#                              error message. "quoted" searches an exact phrase.)
+#   mu-backlog -a TEXT         include closed issues
+#   mu-backlog                 every open issue in the project
+#   mu-backlog -u              print the browser URL for the same query
+#
+# Triage rule 3 says search the backlog before opening a ticket, because the
+# same failure usually already has one. This makes that a command instead of a
+# browser round trip. See tiddlers/MU Triage.tid and MU Progress Ticket Template.
+#
+# A search that finds no OPEN issue does not stop there: it retries over closed
+# ones and shows those instead, under a banner. Silence used to be ambiguous --
+# "no match" was printed both when the backlog was genuinely empty and when
+# every match happened to be resolved. During MU triage those are opposite
+# answers. A resolved ticket matching your failure is the single most useful
+# thing the backlog can tell you, because it means a recurrence: the write-up,
+# the root cause and the person who fixed it last time are all already there.
+# (Real case: `mu-backlog orion` reported nothing while five resolved tickets
+# matched, one of them describing exactly the failure being triaged.)
+#
+# Exit status: 0 something was shown, 1 nothing matched at all, 2 usage or
+# request error. Closed-only matches are a find, so they exit 0.
+#
+# The project is the squad's whole backlog -- product work, automation and MU
+# together -- so the default searches all of it. That is usually what you want:
+# the ticket covering your failure may well have been filed as ordinary
+# automation work. Use -m when you specifically want the MU slice.
+#
+# Needs an API key -- not the Atom key, they are different strings. Get it from
+# /my/account, right sidebar, "API access key". Supply it as $REDMINE_KEY, or in
+# a mode-600 file at $REDMINE_KEY_FILE (default
+# ~/.config/qe-virt-openqa/redmine-key). It goes in a header, never in the query
+# string, so it stays out of the server access log.
+#
+# Read-only: GET only. Nothing here can modify a ticket.
+
+set -eu
+
+REDMINE=${REDMINE:-https://progress.opensuse.org}
+PROJECT=${REDMINE_PROJECT:-virtualization}
+REDMINE_KEY_FILE=${REDMINE_KEY_FILE:-$HOME/.config/qe-virt-openqa/redmine-key}
+LIMIT=${LIMIT:-100}
+
+# Redmine's "~" filter is case-insensitive and takes brackets literally, so one
+# pattern covers [MU], [mu] and [Mu]. Verified against the API on 2026-08-28.
+MU_TAG='[MU]'
+
+MODE=subject
+STATUS=open
+URL_ONLY=no
+MU=no
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            # Every comment line of the header block, so adding to the
+            # header cannot silently truncate --help.
+            sed -n '2,/^$/p' "$0" | sed -n 's/^# \{0,1\}//p'
+            exit 0
+            ;;
+        -f|--full)
+            MODE=full
+            ;;
+        -m|--mu)
+            MU=yes
+            ;;
+        -a|--all)
+            STATUS=*
+            ;;
+        -u|--url)
+            URL_ONLY=yes
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "mu-backlog: unknown option '$1'" >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
+TEXT=${1:-}
+
+for tool in curl jq; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "mu-backlog: $tool is not installed" >&2
+        exit 2
+    }
+done
+
+if [ -z "${REDMINE_KEY:-}" ] && [ -r "$REDMINE_KEY_FILE" ]; then
+    REDMINE_KEY=$(cat "$REDMINE_KEY_FILE")
+fi
+
+# -u only builds a URL, so it does not need a key.
+if [ -z "${REDMINE_KEY:-}" ] && [ "$URL_ONLY" != yes ]; then
+    echo "mu-backlog: no API key. Set \$REDMINE_KEY or write it to $REDMINE_KEY_FILE" >&2
+    echo "mu-backlog: get one from $REDMINE/my/account -- 'API access key', not the Atom key" >&2
+    exit 2
+fi
+
+# Redmine allows one "subject" filter per query, so when -m claims it the text
+# is applied here instead, as a plain case-insensitive substring. POST is that
+# leftover; empty means keep everything the server returned.
+POST=
+
+if [ "$MODE" = full ]; then
+    [ -n "$TEXT" ] || {
+        echo "mu-backlog: -f needs some text to search for" >&2
+        exit 2
+    }
+    ENDPOINT="$REDMINE/projects/$PROJECT/search.json"
+    if [ "$MU" = yes ]; then
+        POST=$MU_TAG
+    fi
+else
+    ENDPOINT="$REDMINE/issues.json"
+    if [ "$MU" = yes ]; then
+        POST=$TEXT
+    fi
+fi
+
+# The query is built inside a function so the open pass and the closed-issue
+# fallback below run exactly the same search, differing only in the status
+# filter. Two copies of this would drift, and a fallback that quietly searched
+# for something else would be worse than no fallback at all.
+#
+# $1 is the status: "open" or "*". It has to be saved first, because `set --`
+# rebuilds the positional parameters -- which is the point, that is how the
+# curl argument list gets built fresh on each call. POSIX sh has no `local`, so
+# the scratch variables are underscore-prefixed by convention.
+#
+# curl -G --data-urlencode keeps the caller's shell out of the encoding
+# business, so an error message with spaces, quotes or slashes pastes in as is.
+fetch() {
+    _status=$1
+    if [ "$MODE" = full ]; then
+        set -- -G \
+            --data-urlencode "q=$TEXT" \
+            --data-urlencode "issues=1" \
+            --data-urlencode "limit=$LIMIT"
+        # search.json has no "closed only" filter: dropping open_issues widens
+        # it to everything. That is still correct for the fallback, which only
+        # runs once the open pass has come back empty.
+        if [ "$_status" = open ]; then
+            set -- "$@" --data-urlencode "open_issues=1"
+        fi
+    else
+        set -- -G \
+            --data-urlencode "project_id=$PROJECT" \
+            --data-urlencode "status_id=$_status" \
+            --data-urlencode "sort=updated_on:desc" \
+            --data-urlencode "limit=$LIMIT"
+        if [ "$MU" = yes ]; then
+            set -- "$@" --data-urlencode "subject=~$MU_TAG"
+        elif [ -n "$TEXT" ]; then
+            set -- "$@" --data-urlencode "subject=~$TEXT"
+        fi
+    fi
+    curl -sf -H "X-Redmine-API-Key: $REDMINE_KEY" "$@" "$ENDPOINT"
+}
+
+# Same query, spelled the way the web UI wants it: set_filter=1 resets any
+# sticky filter, then f[]/op/v[] add the subject one back.
+browse_url() {
+    _bstatus=$1
+    if [ "$MODE" = full ]; then
+        printf '%s\n' "$REDMINE/projects/$PROJECT/search?issues=1&q=$TEXT"
+        return 0
+    fi
+    _op=$([ "$_bstatus" = open ] && echo o || echo '*')
+    _url="$REDMINE/projects/$PROJECT/issues?set_filter=1&f[]=status_id&op[status_id]=$_op"
+    if [ "$MU" = yes ]; then
+        _url="$_url&f[]=subject&op[subject]=~&v[subject][]=$MU_TAG"
+    elif [ -n "$TEXT" ]; then
+        _url="$_url&f[]=subject&op[subject]=~&v[subject][]=$TEXT"
+    fi
+    printf '%s\n' "$_url"
+}
+
+# Body on stdin, one TSV row per issue on stdout.
+parse() {
+    if [ "$MODE" = full ]; then
+        jq -r --arg post "$POST" '
+            (.results // [])[]
+            | { id, text: (.title | gsub("\\s+"; " ")) }
+            | select($post == "" or (.text | ascii_downcase | contains($post | ascii_downcase)))
+            | [ .id, .text ]
+            | @tsv'
+    else
+        jq -r --arg post "$POST" '
+            (.issues // [])[]
+            | { id, status: .status.name, text: (.subject | gsub("\\s+"; " ")) }
+            | select($post == "" or (.text | ascii_downcase | contains($post | ascii_downcase)))
+            | [ .id, .status, .text ]
+            | @tsv'
+    fi
+}
+
+# How many the server thought it had, before any client-side filtering. Kept
+# separate so an empty result can be told apart from a parsing failure: those
+# look identical from the outside, and one of them is a bug.
+total_count() {
+    _served=$(jq -r '.total_count // 0')
+    case $_served in
+        ''|*[!0-9]*) _served=0 ;;
+    esac
+    printf '%s\n' "$_served"
+}
+
+if [ "$URL_ONLY" = yes ]; then
+    browse_url "$STATUS"
+    exit 0
+fi
+
+request_failed() {
+    echo "mu-backlog: $ENDPOINT refused the request" >&2
+    echo "mu-backlog: 401 means a bad or non-API key, 403 means no membership in '$PROJECT'" >&2
+    exit 2
+}
+
+body=$(fetch "$STATUS") || request_failed
+rows=$(printf '%s' "$body" | parse)
+served=$(printf '%s' "$body" | total_count)
+
+# The whole point of the repair. An open-only search that finds nothing is not
+# the same as an empty backlog, and printing "no match" for both is what let a
+# resolved ticket describing the exact failure go unread during triage.
+FELL_BACK=no
+CHECKED_CLOSED=no
+if [ -z "$rows" ] && [ "$STATUS" = open ]; then
+    CHECKED_CLOSED=yes
+    if closed_body=$(fetch '*'); then
+        closed_rows=$(printf '%s' "$closed_body" | parse)
+        if [ -n "$closed_rows" ]; then
+            FELL_BACK=yes
+            body=$closed_body
+            rows=$closed_rows
+            served=$(printf '%s' "$closed_body" | total_count)
+        fi
+    fi
+fi
+
+if [ -z "$rows" ]; then
+    if [ "$served" -eq 0 ]; then
+        if [ "$CHECKED_CLOSED" = yes ]; then
+            echo "mu-backlog: no match -- nothing in the backlog looks like this, open or closed" >&2
+        else
+            echo "mu-backlog: no match -- nothing in the backlog looks like this" >&2
+        fi
+        if [ "$MODE" = full ] && [ "$(printf '%s' "$TEXT" | wc -w)" -gt 3 ]; then
+            echo "mu-backlog: -f requires every word to match, and drops very short ones." >&2
+            echo "mu-backlog: try the two or three most distinctive words instead." >&2
+        fi
+        exit 1
+    fi
+    if [ -n "$POST" ]; then
+        echo "mu-backlog: server matched $served, none containing '$POST'" >&2
+        exit 1
+    fi
+    echo "mu-backlog: server matched $served but none were parsed." >&2
+    echo "mu-backlog: that is a bug in this script, not a clean miss -- the JSON shape moved." >&2
+    exit 2
+fi
+
+if [ "$FELL_BACK" = yes ]; then
+    echo "mu-backlog: no OPEN issue matches. These are closed or resolved:" >&2
+    echo >&2
+fi
+
+if [ "$MODE" = full ]; then
+    printf '%s\n' "$rows" | awk -F'\t' '{ printf "%-8s %s\n", $1, $2 }'
+else
+    printf '%s\n' "$rows" | awk -F'\t' '{ printf "%-8s %-14s %s\n", $1, $2, $3 }'
+fi
+
+shown=$(printf '%s\n' "$rows" | wc -l)
+if [ "$FELL_BACK" = yes ]; then
+    printf '\n%s closed; server matched %s (limit %s). Ticket URL: %s/issues/<id>\n' \
+        "$shown" "$served" "$LIMIT" "$REDMINE" >&2
+    echo "mu-backlog: a resolved ticket matching your failure usually means a recurrence --" >&2
+    echo "mu-backlog: read it before filing a new one, then reference or reopen it." >&2
+else
+    printf '\n%s shown; server matched %s (limit %s). Ticket URL: %s/issues/<id>\n' \
+        "$shown" "$served" "$LIMIT" "$REDMINE" >&2
+fi

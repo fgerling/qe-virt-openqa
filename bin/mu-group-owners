@@ -1,0 +1,110 @@
+#!/bin/sh
+# Who owns which openQA job group.
+#
+#   mu-group-owners            job groups whose description claims qe-virt
+#   mu-group-owners --all      every job group that names an owner at all
+#   mu-group-owners --check    qe-virt groups whose maintainer line is not canonical
+#   mu-group-owners PATTERN    groups whose description matches PATTERN (case-insensitive)
+#
+# openQA job group descriptions carry a free-text owner line, and most teams keep
+# it current -- it is the cheapest authority on who owns a red box you did not
+# expect. See tiddlers/MU Job Groups.tid, "Is this group ours?".
+#
+# Match on the address, not on the word "Maintainer": the convention is not
+# uniform. "Maintainer:", "Maintainers:", "Contact:" and "Owned by
+# qe-virtualization squad" all occur in the wild, and a third of the groups
+# carry no description at all.
+#
+# --check exits non-zero when any qe-virt group drifts from CANONICAL, so it can
+# be run as a periodic check rather than read by eye.
+#
+# Read-only: one GET against the public job_groups API. No API key, no VPN.
+
+set -eu
+
+OSD=${OSD:-https://openqa.suse.de}
+
+# Group 686 is the model the squad settled on.
+CANONICAL='Maintainer: QE-virtualization qe-virt@suse.de Slack: #team-lsg-qe-virt'
+
+# Both spellings appear across the groups.
+OURS='qe-?virt'
+
+# Anything that looks like it names a team, for --all.
+ANY_OWNER='maintainer|contact|owned by|responsible'
+
+MODE=list
+PATTERN=$OURS
+
+case "${1:-}" in
+    -h|--help)
+        sed -n '2,21p' "$0" | cut -c3-
+        exit 0
+        ;;
+    --all)
+        PATTERN=$ANY_OWNER
+        ;;
+    --check)
+        MODE=check
+        ;;
+    -*)
+        echo "mu-group-owners: unknown option '$1'" >&2
+        exit 2
+        ;;
+    "")
+        ;;
+    *)
+        PATTERN=$1
+        ;;
+esac
+
+for tool in curl jq; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "mu-group-owners: $tool is not installed" >&2
+        exit 2
+    }
+done
+
+groups=$(curl -sf "$OSD/api/v1/job_groups") || {
+    echo "mu-group-owners: cannot reach $OSD/api/v1/job_groups" >&2
+    exit 2
+}
+
+if [ "$MODE" = check ]; then
+    drift=$(printf '%s' "$groups" | jq -r --arg canon "$CANONICAL" --arg pat "$OURS" '
+        .[]
+        | select((.description // "") | test($pat; "i"))
+        | select((.description // "") | contains($canon) | not)
+        | [ .id,
+            .name,
+            (( .description // "" )
+             | split("\r?\n"; "")
+             | map(select(test("maintainer|contact|owned by"; "i")))
+             | join(" / "))
+          ]
+        | @tsv' | sort -n)
+
+    if [ -z "$drift" ]; then
+        echo "all qe-virt job groups carry the canonical maintainer line"
+        exit 0
+    fi
+
+    echo "canonical: $CANONICAL"
+    echo
+    printf '%s\n' "$drift" | awk -F'\t' '{ printf "%-5s %-50s %s\n", $1, $2, ($3 == "" ? "(no owner line)" : $3) }'
+    echo
+    echo "$(printf '%s\n' "$drift" | wc -l) group(s) differ" >&2
+    exit 1
+fi
+
+printf '%s' "$groups" | jq -r --arg pat "$PATTERN" '
+    .[]
+    | select((.description // "") | test($pat; "i"))
+    | [ .id,
+        .name,
+        (( .description // "" )
+         | split("\r?\n"; "")
+         | map(select(test("maintainer|contact|owned by|responsible"; "i")))
+         | join(" / "))
+      ]
+    | @tsv' | sort -n | awk -F'\t' '{ printf "%-5s %-50s %s\n", $1, $2, ($3 == "" ? "(no owner line)" : $3) }'

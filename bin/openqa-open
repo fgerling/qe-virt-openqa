@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Open openQA jobs in the browser.
+
+  openqa-open 24226643 24225067 24318671    three tabs on OSD
+  openqa-open -n 24226643 24225067          print the URLs instead of opening
+  openqa-open -i o3 5012345                 another instance
+  openqa-open 24233493..24233530            a whole batch
+  openqa-open 24233493+5                    that job and the next five
+  openqa-open https://openqa.suse.de/tests/24226643#step/sev_snp_validation/5
+
+Why this exists: triage arrives in batches. mu-queue prints a column of job
+IDs, revtui shows another, and turning either into tabs is otherwise a shell
+loop rewritten from scratch every time -- with the instance URL retyped and
+the occasional fat-fingered ID opening someone else's job. open-mu-groups does
+this for the group overviews; this is the per-job counterpart.
+
+A job reference is a bare ID, a comma-separated list, an inclusive range
+(24233493..24233530), a count (24233493+5), or any job URL openQA serves:
+/tests/<id>, /t/<id> and /t<id>, with a #step/... anchor if you pasted it
+straight from the browser. A reference that carries its own host overrides
+--instance, so two instances can be mixed in one command.
+
+Every reference is parsed before anything is opened, so a typo in the last
+argument does not leave you with half a screen of tabs.
+
+Read-only: this opens pages. It schedules nothing, and there is no code path
+here that could -- see the rule at the top of CLAUDE.md.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+# Short names for the instances that come up; anything else can be given as a
+# bare hostname or a full URL.
+INSTANCES = {
+    "osd": "https://openqa.suse.de",
+    "o3": "https://openqa.opensuse.org",
+}
+DEFAULT_INSTANCE = "osd"
+
+# Same forms openqa-clone-job-with-secrets accepts, deliberately: /tests/<id>,
+# /t/<id> and /t<id>. Kept as one lazy match with no anchor at the end so a
+# pasted URL may carry a #step/... anchor or a query string.
+JOB_URL_RE = re.compile(r"^(https?://[^/]+).*?/(?:tests/|t/?)(\d+)")
+
+RANGE_RE = re.compile(r"^(\d+)\.\.(\d+)$")
+COUNT_RE = re.compile(r"^(\d+)\+(\d+)$")
+
+# A range is the only way to ask for an unbounded number of tabs by accident,
+# so it is bounded twice: absurd spans are rejected outright while expanding,
+# and a merely large result needs --force.
+MAX_SPAN = 1000
+TAB_LIMIT = 20
+
+
+def normalise_instance(value):
+    """Short name, bare hostname or URL -> scheme-qualified origin."""
+    if value in INSTANCES:
+        return INSTANCES[value]
+    if not re.match(r"^https?://", value):
+        value = "https://" + value
+    return value.rstrip("/")
+
+
+def expand(ref, default_host):
+    """Expand one command-line reference into (host, job_id) pairs.
+
+    Raises ValueError with a message meant for the user.
+    """
+    if m := JOB_URL_RE.match(ref):
+        return [(m.group(1), m.group(2))]
+
+    if m := RANGE_RE.match(ref):
+        first, last = int(m.group(1)), int(m.group(2))
+        if last < first:
+            raise ValueError(f"range runs backwards: {ref}")
+        if last - first + 1 > MAX_SPAN:
+            raise ValueError(f"range spans more than {MAX_SPAN} jobs: {ref}")
+        return [(default_host, str(n)) for n in range(first, last + 1)]
+
+    if m := COUNT_RE.match(ref):
+        first, count = int(m.group(1)), int(m.group(2))
+        if count + 1 > MAX_SPAN:
+            raise ValueError(f"count asks for more than {MAX_SPAN} jobs: {ref}")
+        return [(default_host, str(n)) for n in range(first, first + count + 1)]
+
+    if ref.isdigit():
+        return [(default_host, ref)]
+
+    raise ValueError(f"cannot parse a job reference out of {ref!r}")
+
+
+def collect(refs, default_host):
+    """Expand every reference, reporting all bad ones rather than the first.
+
+    Duplicates are dropped but order is kept: the same job named twice, or
+    caught by two overlapping ranges, is still one tab.
+    """
+    urls, seen, errors = [], set(), []
+    for ref in refs:
+        for part in ref.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                pairs = expand(part, default_host)
+            except ValueError as e:
+                errors.append(str(e))
+                continue
+            for host, job in pairs:
+                url = f"{host}/tests/{job}"
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+    return urls, errors
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="openqa-open",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("jobs", nargs="+", metavar="JOB",
+                   help="job ID, comma list, range (a..b), count (a+n), or URL")
+    p.add_argument("-i", "--instance", default=DEFAULT_INSTANCE,
+                   help=f"short name ({', '.join(INSTANCES)}), hostname or URL "
+                        f"(default: {DEFAULT_INSTANCE})")
+    p.add_argument("-n", "--print", dest="print_only", action="store_true",
+                   help="print the URLs instead of opening them; foot's URL "
+                        "mode (ctrl+shift+u) turns them back into links")
+    p.add_argument("--force", action="store_true",
+                   help=f"open more than {TAB_LIMIT} tabs")
+    args = p.parse_args()
+
+    host = normalise_instance(args.instance)
+    urls, errors = collect(args.jobs, host)
+
+    # Nothing is opened until every reference has parsed.
+    if errors:
+        for e in errors:
+            print(f"openqa-open: {e}", file=sys.stderr)
+        return 2
+    if not urls:
+        print("openqa-open: no job references given", file=sys.stderr)
+        return 2
+
+    if args.print_only:
+        print("\n".join(urls))
+        return 0
+
+    if len(urls) > TAB_LIMIT and not args.force:
+        print(f"openqa-open: {len(urls)} tabs is more than the {TAB_LIMIT} "
+              f"guard allows; use --print to list them or --force to open them",
+              file=sys.stderr)
+        return 2
+
+    # xdg-open rather than a hardcoded browser, so this follows the desktop
+    # default; BROWSER still wins, as it does for open-mu-groups.
+    browser = os.environ.get("BROWSER") or "xdg-open"
+
+    failed = 0
+    for url in urls:
+        try:
+            r = subprocess.run([browser, url], check=False)
+        except FileNotFoundError:
+            print(f"openqa-open: no such browser: {browser}", file=sys.stderr)
+            return 1
+        if r.returncode != 0:
+            print(f"openqa-open: {browser} exited {r.returncode} for {url}",
+                  file=sys.stderr)
+            failed += 1
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Which test modules are systemically failing, ranked.
+
+  mu-modules                             last 7 days, all MU groups, worst first
+  mu-modules --days 30                   wider window (raise --limit too, see below)
+  mu-modules --group 559                 one job group, repeatable
+  mu-modules --min 3                     minimum executions to be ranked (default 5)
+  mu-modules --master-only               ignore jobs running a CASEDIR fork
+  mu-modules --json                      for jq
+
+  mu-modules --by test                   split per test suite
+  mu-modules --by scenario               alias for --by test,machine
+  mu-modules --by test,machine,version   the full openQA scenario
+  mu-modules --by machine                which hardware is unhappy, across suites
+
+Why this exists: [[MU Daily Checklist]] gives a failure ten minutes before it
+becomes a ticket, and the useful thing to know inside those ten minutes is
+whether anyone has seen it before. A module failing a third of the time all week
+is a systemic problem to file once; the same red box met alone looks like bad
+luck and gets investigated from scratch every morning. mu-queue answers "what
+still needs a verdict today"; this answers "what has been broken all week".
+
+THE DENOMINATOR IS EXECUTIONS, NOT JOBS. A module that comes late in the
+schedule is skipped whenever anything earlier fails, so dividing its failures by
+the number of jobs makes late modules look reliable purely because they rarely
+get to run -- the ranking inverts. Only `passed`, `failed` and `softfailed`
+count as an execution; `skipped`, `none` and `canceled` are censored
+observations. Same correction verify-confidence applies to a clean streak.
+
+Ranking is by the Wilson lower bound rather than the raw rate, so 1 failure in 6
+does not outrank 7 in 20. Softfails are counted but never enter the rate: most
+are deliberate `record_soft_failure` calls carrying a bsc#, and ranking on them
+would fill the top of the list with issues that are already triaged.
+
+The `flip` column counts a module that failed in a job and passed in that job's
+clone -- same code, same scenario, opposite result. That is a controlled
+observation of flakiness, and worth more than any rate: a rate cannot tell
+"intermittent" from "consistently broken on one machine", a flip can.
+
+The `delta` column compares against the preceding window of the same length, so
+--days 30 compares the last 30 days with days 30-60. A module stuck high for
+months usually has a bugref already; one that went from 0% to 30% this week is
+the one that wants a human. The `was` column shows the fail/ran it is comparing
+against, because a delta off one prior execution is noise wearing a percentage
+sign: delta reads `?` when that sample is under --min and `new` when the module
+did not run then at all. Note --limit has to reach back 2x--days, and the
+warning when it doesn't is about the prior window, i.e. about delta.
+
+Feeding verify-confidence: use --by test,machine --master-only. The default
+output blends machines, products and topic branches, and is a triage
+prioritiser, not a measurement. Narrowed to one scenario on master it is the
+baseline verify-confidence wants.
+
+Cost is one request per group -- /api/v1/jobs embeds each job's module list, so
+the expensive per-job /details endpoint is not needed. Read-only: plain GETs
+against openqa.suse.de, no API key, no VPN.
+"""
+
+import argparse
+import json
+import math
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+OSD = "https://openqa.suse.de"
+HERE = Path(__file__).resolve().parent
+JOB_GROUPS = HERE.parent / "etc" / "job-groups"
+
+# A module is only evidence about itself if it actually ran.
+EXECUTED = {"passed", "failed", "softfailed"}
+
+# openQA marks a module scheduled more than once two different ways -- an `N_`
+# prefix (`1_parallel_guest_migration_source`) and a `#N` suffix
+# (`login_console#1`, `cleanup_libvirtd_log#9`). Both are the same code as the
+# bare name. Left unmerged they split one signal across a dozen rows, each too
+# small to rank; merged, a module that runs nine times a job gets nine times the
+# evidence.
+REPEAT = re.compile(r"^\d+_|#\d+$")
+
+# What --by can split on. `test` is a top-level job field, the rest are settings.
+DIMENSIONS = {
+    "test": lambda job: job.get("test") or "?",
+    "machine": lambda job: (job.get("settings") or {}).get("MACHINE", "?"),
+    "version": lambda job: (job.get("settings") or {}).get("VERSION", "?"),
+    "flavor": lambda job: (job.get("settings") or {}).get("FLAVOR", "?"),
+    "arch": lambda job: (job.get("settings") or {}).get("ARCH", "?"),
+}
+
+# openQA's own word for test@machine, and the unit verify-confidence reasons in.
+ALIASES = {"scenario": "test,machine"}
+
+
+def get_json(url):
+    with urllib.request.urlopen(url) as response:
+        return json.load(response)
+
+
+def read_group_ids(path):
+    """Job group IDs from etc/job-groups, comments and blank lines dropped."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        sys.exit(f"cannot read the job groups: {exc}")
+
+    gids = []
+    for line in lines:
+        gids.extend(line.split("#", 1)[0].split())
+
+    # A group name written without its '#' would otherwise be queried as a group.
+    bad = [gid for gid in gids if not gid.isdigit()]
+    if bad:
+        sys.exit(f"{path}: not a job group ID: {', '.join(bad)}")
+    if not gids:
+        sys.exit(f"{path}: no job group IDs found")
+    return gids
+
+
+def parse_dimensions(text):
+    """--by module | test | scenario | test,machine,version | ..."""
+    text = ALIASES.get(text, text)
+    if text in ("", "module"):
+        return []
+    dims = [d.strip() for d in text.split(",") if d.strip()]
+    unknown = [d for d in dims if d not in DIMENSIONS]
+    if unknown:
+        sys.exit(
+            f"--by: unknown dimension(s) {', '.join(unknown)}; "
+            f"pick from module, scenario, {', '.join(DIMENSIONS)}"
+        )
+    return dims
+
+
+def wilson_lower(failures, executions, z=1.96):
+    """Lower bound of the 95% Wilson interval for failures/executions.
+
+    Ranking on this instead of the raw rate is what stops 1-in-6 outranking
+    7-in-20: a small sample is pulled toward zero in proportion to how little
+    it says.
+    """
+    if not executions:
+        return 0.0
+    p = failures / executions
+    denominator = 1 + z**2 / executions
+    centre = p + z**2 / (2 * executions)
+    spread = z * math.sqrt(p * (1 - p) / executions + z**2 / (4 * executions**2))
+    return max(0.0, (centre - spread) / denominator)
+
+
+def on_master(job):
+    """True if the job ran the deployed distri, not somebody's topic branch.
+
+    Only a CASEDIR that is a *remote checkout* means a fork: os-autoinst clones
+    that URL and checks out the `#ref` at job start, so the code under test is
+    not what is merged. Counting those as baseline mixes fixed and unfixed code.
+
+    The presence of CASEDIR alone is NOT the test, which is what this used to
+    get wrong. 296 of the last 708 jobs -- groups 542, 570, 575 and 691 -- set
+    the bare relative value `CASEDIR=sle`, naming the distri directory already
+    deployed on the worker. Those are master. Treating them as forks threw away
+    42% of the window and quietly reshaped every rate it was supposed to clean.
+    """
+    casedir = (job.get("settings") or {}).get("CASEDIR", "")
+    return not ("#" in casedir or "://" in casedir or casedir.startswith("git@"))
+
+
+def fetch_jobs(gid, oldest, limit):
+    """Finished jobs in `gid` no older than `oldest`, module lists included.
+
+    Returns (jobs, truncated). Truncated means the window reaches further back
+    than the request did, so the counts would silently undercount.
+    """
+    jobs = get_json(f"{OSD}/api/v1/jobs?groupid={gid}&limit={limit}")["jobs"]
+    finished = []
+    reach = None
+    for job in jobs:
+        stamp = job.get("t_finished")
+        if not stamp:
+            continue
+        when = datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+        reach = when if reach is None else min(reach, when)
+        if when >= oldest:
+            finished.append((when, job))
+    return finished, bool(jobs) and reach is not None and reach > oldest
+
+
+def key_for(job, name, dims):
+    return (name,) + tuple(DIMENSIONS[d](job) for d in dims)
+
+
+def tally(jobs, dims):
+    """Count executions, failures and softfails per key over `jobs`."""
+    stats = defaultdict(lambda: {"executed": 0, "failed": 0, "softfailed": 0, "suites": set()})
+    for _, job in jobs:
+        for module in job.get("modules") or []:
+            if module["result"] not in EXECUTED:
+                continue
+            row = stats[key_for(job, REPEAT.sub("", module["name"]), dims)]
+            row["executed"] += 1
+            row["suites"].add(job.get("test") or "?")
+            if module["result"] == "failed":
+                row["failed"] += 1
+            elif module["result"] == "softfailed":
+                row["softfailed"] += 1
+    return stats
+
+
+def count_flips(jobs, dims):
+    """Modules that failed in a job and passed in that job's clone.
+
+    openQA points a superseded job's clone_id at its replacement, so a pair is
+    the same scenario re-run on the same code. A module failing in the original
+    and passing in the clone is the cleanest flakiness evidence there is, and it
+    costs nothing: both jobs are already in the fetched data.
+    """
+    by_id = {job["id"]: job for _, job in jobs}
+    flips = defaultdict(int)
+    for _, job in jobs:
+        clone = by_id.get(job.get("clone_id"))
+        if not clone:
+            continue
+        after = {REPEAT.sub("", m["name"]): m["result"] for m in clone.get("modules") or []}
+        for module in job.get("modules") or []:
+            if module["result"] != "failed":
+                continue
+            name = REPEAT.sub("", module["name"])
+            if after.get(name) in ("passed", "softfailed"):
+                flips[key_for(job, name, dims)] += 1
+    return flips
+
+
+def collect(gids, days, dims, limit, master_only=False):
+    """Tally the window and the one before it, so a delta can be shown."""
+    now = datetime.now(timezone.utc)
+    recent_from = now - timedelta(days=days)
+    prior_from = now - timedelta(days=days * 2)
+
+    recent, prior, truncated, dropped = [], [], [], 0
+    for gid in gids:
+        try:
+            jobs, cut_short = fetch_jobs(gid, prior_from, limit)
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            sys.exit(f"group {gid}: {err}")
+        if cut_short:
+            truncated.append(gid)
+        if master_only:
+            before = len(jobs)
+            jobs = [(w, j) for w, j in jobs if on_master(j)]
+            dropped += before - len(jobs)
+        recent += [(w, j) for w, j in jobs if w >= recent_from]
+        prior += [(w, j) for w, j in jobs if w < recent_from]
+
+    return (
+        tally(recent, dims),
+        tally(prior, dims),
+        count_flips(recent, dims),
+        truncated,
+        dropped,
+    )
+
+
+def label_for(key, dims):
+    """Render the non-module part of a key the way openQA writes it."""
+    values = dict(zip(dims, key[1:]))
+    parts = [values[d] for d in ("version", "flavor", "arch") if d in values]
+    if "test" in values and "machine" in values:
+        parts.append(f"{values['test']}@{values['machine']}")
+    elif "test" in values:
+        parts.append(values["test"])
+    elif "machine" in values:
+        parts.append(values["machine"])
+    return " ".join(parts)
+
+
+def rows_for(recent, prior, flips, minimum, dims):
+    """Rank the recent window, carrying the prior window's raw counts.
+
+    The prior counts travel with the row rather than being folded into a delta
+    on the spot, because a delta computed off one prior execution is noise
+    wearing a percentage sign. --min guards the recent window; the same
+    threshold has to guard the one being compared against.
+    """
+    rows = []
+    for key, cur in recent.items():
+        if cur["executed"] < minimum or not cur["failed"]:
+            continue
+        was = prior.get(key) or {"failed": 0, "executed": 0}
+        rows.append(
+            {
+                "module": key[0],
+                "where": label_for(key, dims) if dims else None,
+                "rate": cur["failed"] / cur["executed"],
+                "failed": cur["failed"],
+                "softfailed": cur["softfailed"],
+                "executed": cur["executed"],
+                "flips": flips.get(key, 0),
+                "score": wilson_lower(cur["failed"], cur["executed"]),
+                "prior_failed": was["failed"],
+                "prior_executed": was["executed"],
+                "previous_rate": (
+                    was["failed"] / was["executed"] if was["executed"] else None
+                ),
+                "delta_trustworthy": was["executed"] >= minimum,
+                "suites": sorted(cur["suites"]),
+            }
+        )
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def format_delta(row):
+    """The delta, or an honest reason there isn't one.
+
+    `new` means the module never ran in the prior window; `?` means it ran too
+    few times to compare against. Both used to render as a confident-looking
+    percentage.
+    """
+    if not row["prior_executed"]:
+        return "new"
+    if not row["delta_trustworthy"]:
+        return "?"
+    change = row["rate"] - row["previous_rate"]
+    return f"{change:+.0%}" if abs(change) >= 0.005 else "="
+
+
+def render(rows, dims, days):
+    if not rows:
+        print(f"no module failed more than the threshold in the last {days} days")
+        return
+
+    width = max(len(r["module"]) for r in rows)
+    before_of = {
+        id(r): (f"{r['prior_failed']}/{r['prior_executed']}" if r["prior_executed"] else "-")
+        for r in rows
+    }
+    before_width = max(len("was"), max(len(v) for v in before_of.values()))
+    header = (
+        f"{'rank':>5} {'rate':>5} {'fail':>4} {'soft':>4} {'flip':>4} {'ran':>4} "
+        f"{'was':>{before_width}} {'delta':>6}  {'module':<{width}}"
+    )
+    tail_header = ", ".join(dims) if dims else "suites"
+    print(f"{header}  {tail_header}")
+    print("-" * len(header) + "  " + "-" * len(tail_header))
+    for r in rows:
+        if dims:
+            tail = r["where"]
+        else:
+            tail = ", ".join(r["suites"][:2])
+            if len(r["suites"]) > 2:
+                tail += f" +{len(r['suites']) - 2}"
+        print(
+            f"{r['score']:5.0%} {r['rate']:5.0%} {r['failed']:4d} {r['softfailed']:4d} "
+            f"{r['flips'] or '':>4} {r['executed']:4d} "
+            f"{before_of[id(r)]:>{before_width}} {format_delta(r):>6}  "
+            f"{r['module']:<{width}}  {tail}"
+        )
+    print()
+    print("rank = 95% lower bound on the true rate; sorting on it keeps a small")
+    print("       sample from outranking a well-evidenced one. ran = executions,")
+    print("       not jobs: skipped modules are censored, not passes. flip = failed")
+    print("       in a job and passed in its clone, i.e. proven intermittent.")
+    print("was  = the same fail/ran in the preceding window, which delta compares")
+    print("       against. delta is `?` when that sample is under --min and `new`")
+    print("       when the module did not run then at all -- neither is a 0% before.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("-d", "--days", type=int, default=7, metavar="N",
+                        help="window in days (default 7); the delta compares the N before that")
+    parser.add_argument("-g", "--group", action="append", metavar="ID",
+                        help="one job group, repeatable (default: all of etc/job-groups)")
+    parser.add_argument("-b", "--by", default="module", metavar="DIMS",
+                        help="module (default), scenario, or a comma list of "
+                             "test,machine,version,flavor,arch")
+    parser.add_argument("-m", "--min", type=int, default=5, metavar="N",
+                        help="minimum executions before a module is ranked (default 5)")
+    parser.add_argument("-l", "--limit", type=int, default=600, metavar="N",
+                        help="jobs to request per group (default 600); must reach back 2x--days")
+    parser.add_argument("-M", "--master-only", action="store_true",
+                        help="skip jobs running a CASEDIR fork, so the rate is master's")
+    parser.add_argument("-j", "--json", action="store_true", help="emit JSON instead of a table")
+    args = parser.parse_args()
+
+    dims = parse_dimensions(args.by)
+    gids = args.group or read_group_ids(JOB_GROUPS)
+    recent, prior, flips, truncated, dropped = collect(
+        gids, args.days, dims, args.limit, args.master_only
+    )
+    rows = rows_for(recent, prior, flips, args.min, dims)
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        render(rows, dims, args.days)
+        if args.master_only:
+            print(f"       --master-only dropped {dropped} job(s) running a CASEDIR fork.")
+
+    if truncated:
+        print(
+            f"\nwarning: --limit {args.limit} did not reach back "
+            f"{args.days * 2} days for group(s) {', '.join(truncated)}; counts undercount. "
+            f"Raise --limit.",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    main()

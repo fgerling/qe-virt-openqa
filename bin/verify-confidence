@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""How much a clean streak of verification runs actually proves.
+
+  verify-confidence 8/21 11          baseline 8 failures in 21 runs, 11 clean since
+  verify-confidence 8/24 11 --plan   also: how many more runs buy how much
+  verify-confidence 8/21 11 --json   machine-readable
+
+Why this exists: "I reran it ten times and it passed" is not a result until you
+say what the failure rate *was*. A test that fails 1 time in 3 gives you ten
+clean runs by luck 1.7% of the time; one that fails 1 time in 20 gives you ten
+clean runs 60% of the time, and the same streak means nothing at all.
+
+Two numbers come out, and they answer different questions:
+
+  p-value      how surprised the OLD failure rate would be by your clean streak.
+               Small = the change did something. This is P(data | unchanged),
+               NOT the probability that you got lucky -- the inverse is not a
+               thing you can compute without a prior.
+  upper bound  the highest failure rate still consistent with the streak.
+               This is the honest ceiling on "how fixed is it". It falls slowly:
+               11 clean runs only bounds it below 24%, and no number of clean
+               runs ever reaches zero.
+
+COUNT ONLY RUNS THAT REACHED THE CODE UNDER TEST, on both sides of the
+comparison. A job that died in `installation` before the module ever executed
+is a censored observation, not a failure -- scoring it as a failure penalises
+the fix for something it never touched, and dropping it from only one side
+inflates the result. Same rule for the baseline or the numbers are worthless.
+"""
+
+import argparse
+import json
+import math
+import sys
+from math import comb, log
+
+
+def streak_probability(rate, clean):
+    """P(observing `clean` consecutive clean runs | true failure rate `rate`)."""
+    return (1 - rate) ** clean
+
+
+def upper_bound(clean, confidence=0.95):
+    """Highest failure rate that still yields `clean` clean runs at 1-confidence.
+
+    One-sided Clopper-Pearson: solve (1-p)**clean == 1-confidence. One-sided is
+    right here -- nobody worries the fix made things better than expected.
+    """
+    if clean == 0:
+        return 1.0
+    return 1 - (1 - confidence) ** (1 / clean)
+
+
+def runs_needed(rate, confidence=0.95):
+    """Consecutive clean runs needed to push the upper bound below `rate`."""
+    return math.ceil(log(1 - confidence) / log(1 - rate))
+
+
+def fisher_exact(a, b, c, d):
+    """Two-sided Fisher exact p for [[a, b], [c, d]], no scipy."""
+
+    def hypergeom(a, b, c, d):
+        return comb(a + b, a) * comb(c + d, c) / comb(a + b + c + d, a + c)
+
+    observed = hypergeom(a, b, c, d)
+    total = tail = 0.0
+    for i in range(min(a + b, a + c) + 1):
+        j, k = (a + b) - i, (a + c) - i
+        l = (c + d) - k
+        if j < 0 or k < 0 or l < 0:
+            continue
+        p = hypergeom(i, j, k, l)
+        total += p
+        if p <= observed + 1e-12:
+            tail += p
+    return tail / total
+
+
+def parse_baseline(text):
+    try:
+        failures, runs = (int(n) for n in text.split("/", 1))
+    except ValueError:
+        sys.exit(f"baseline must look like 8/21, got {text!r}")
+    if not 0 <= failures <= runs or runs == 0:
+        sys.exit(f"nonsensical baseline {text!r}")
+    return failures, runs
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("baseline", help="failures/runs before the change, e.g. 8/21")
+    ap.add_argument("clean", type=int, help="consecutive clean runs since the change")
+    ap.add_argument("--plan", action="store_true", help="runs needed for tighter bounds")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    failures, runs = parse_baseline(args.baseline)
+    rate = failures / runs
+    pvalue = streak_probability(rate, args.clean)
+    bound = upper_bound(args.clean)
+    fisher = fisher_exact(failures, runs - failures, 0, args.clean)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "baseline_rate": rate,
+                    "clean_runs": args.clean,
+                    "pvalue": pvalue,
+                    "fisher_exact": fisher,
+                    "upper_bound_95": bound,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    print(f"baseline      {failures}/{runs} = {rate:.1%} failure rate")
+    print(f"since         {args.clean} clean runs, 0 failures")
+    print()
+    print(f"p-value       {pvalue:.4f}  ({pvalue:.2%})  P(this streak | rate unchanged)")
+    print(f"Fisher exact  {fisher:.4f}  two-sided, baseline vs streak")
+    print(f"95% bound     failure rate is now below {bound:.1%}")
+    print()
+    verdict = "unchanged rate ruled out" if pvalue < 0.05 else "NOT yet conclusive"
+    print(f"=> {verdict}; supports 'reduced', not 'eliminated'")
+
+    if args.plan:
+        print()
+        print("clean runs needed to bound the rate below:")
+        for target in (0.30, 0.25, 0.20, 0.15, 0.10, 0.05):
+            need = runs_needed(target)
+            more = need - args.clean
+            todo = "reached" if more <= 0 else f"{more} more"
+            print(f"  {target:4.0%}  {need:3d} total  ({todo})")
+
+
+if __name__ == "__main__":
+    main()

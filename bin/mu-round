@@ -1,0 +1,123 @@
+#!/bin/sh
+# Start the MU review round.
+#
+#   mu-round               the whole opening: entry points, incidents, config, worklist
+#   mu-round -n            skip the revtui config refresh (the slow part)
+#   mu-round -I            skip the incident scan
+#   mu-round -d 3          narrower worklist window (default 7 days)
+#
+# The round has three moving parts that go stale between sessions, and this runs
+# them in the order that matters. The incident scan first, because it is the
+# incoming side -- which updates are ours at all -- and step 2 of the checklist
+# asks it before any job is opened. Then etc/revtui-mu.toml, because its build
+# lists rot within a day; then the worklist, because you want to know how big the
+# round is before you open twenty tabs.
+#
+# It deliberately stops short of opening the browser. Steps 1-3 of the checklist
+# are judgement -- what is blocking most, what touches a watched package, whether
+# somebody already claimed the update -- and doing them after the tabs are up is
+# how you end up reviewing something twice.
+#
+# Read-only, like everything else here: GETs against openqa.suse.de and
+# dashboard.qam.suse.de. It cannot schedule, restart or cancel a job.
+#
+# See tiddlers/MU Daily Checklist for the full round, MU Triage for the verdicts.
+
+set -eu
+
+HERE=$(dirname "$(readlink -f "$0")")
+ROOT=$(dirname "$HERE")
+GROUPS_SH="$HERE/open-mu-groups"
+
+# Run from the root so the paths printed under "Next" are the paths you can type.
+cd "$ROOT"
+
+DAYS=7
+REFRESH=yes
+INCIDENTS=yes
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed -n 's/^# \{0,1\}//p'
+            exit 0
+            ;;
+        -n|--no-refresh)
+            REFRESH=no
+            ;;
+        -I|--no-incidents)
+            INCIDENTS=no
+            ;;
+        -d|--days)
+            shift
+            [ $# -gt 0 ] || { echo "mu-round: -d needs a number of days" >&2; exit 2; }
+            DAYS=$1
+            ;;
+        -*)
+            echo "mu-round: unknown option '$1'" >&2
+            exit 2
+            ;;
+        *)
+            echo "mu-round: unexpected argument '$1'" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# The entry-point URLs live in open-mu-groups' ENTRY block -- one place to
+# change when a dashboard moves.
+entry_urls() {
+    sed -n '/^ENTRY="/,/"$/p' "$GROUPS_SH" | sed 's/^ENTRY="//; s/"$//'
+}
+
+printf '\nYours before the worklist -- these three need a person, not a script:\n\n'
+n=1
+for url in $(entry_urls); do
+    printf '  %s. %s\n' "$n" "$url"
+    n=$((n + 1))
+done
+printf '  %s. #discuss-qa-maintenance -- check the canvas, somebody may have it already\n' "$n"
+
+if [ "$INCIDENTS" = yes ]; then
+    printf '\nIncidents on the watch list:\n\n'
+    # Captured rather than piped: this is /bin/sh, so a pipeline reports the
+    # status of sed and the failure would go unnoticed. Not fatal either way --
+    # the worklist below stands on its own if the dashboard is unreachable.
+    if scan=$("$HERE/mu-incidents" --brief 2>&1); then
+        printf '%s\n' "$scan" | sed 's/^./  &/'
+    else
+        echo "mu-round: incident scan failed -- carrying on without it" >&2
+        printf '%s\n' "$scan" | sed 's/^./  &/' >&2
+    fi
+fi
+
+if [ "$REFRESH" = yes ]; then
+    printf '\nRefreshing etc/revtui-mu.toml\n'
+    log=$(mktemp)
+    trap 'rm -f "$log"' EXIT
+    if "$HERE/mu-revtui-config" >/dev/null 2>"$log"; then
+        groups=$(grep -c 'build(s)' "$log" || true)
+        builds=$(sed -n 's/.*-- \([0-9][0-9]*\) build(s).*/\1/p' "$log" \
+                 | awk '{ total += $1 } END { print total + 0 }')
+        printf '  %s groups, %s builds\n' "$groups" "$builds"
+    else
+        # A stale config still works, it just hides the newest incidents, so this
+        # is a warning and not the end of the round.
+        echo "mu-round: could not refresh the revtui config -- keeping the old one" >&2
+        sed 's/^/  /' "$log" >&2
+    fi
+fi
+
+printf '\nWorklist -- last %s days:\n' "$DAYS"
+"$HERE/mu-queue" --days "$DAYS"
+
+cat <<'EOF'
+
+Next:
+  bin/open-mu-groups                     the job groups as browser tabs
+  openqa-revtui -c etc/revtui-mu.toml    the same round in one terminal
+
+Ten minutes per failure to decide what kind of problem it is, not to fix it.
+Every red box gets a comment -- a bugref, or one of the four tags in MU Triage.
+EOF
